@@ -19,7 +19,7 @@ struct State {
     int lastlist = -1;
     std::vector<int> match_set;
     
-    // For capture groups - track start and end of captures
+    // For capture groups
     int capture_start = -1;  // If >= 0, this state starts capture group N
     int capture_end = -1;    // If >= 0, this state ends capture group N
 };
@@ -40,13 +40,12 @@ enum {
     MatchAntiChoice,
     MatchStart,
     MatchEnd,
-    Epsilon = 299,
     BackRefStart = 300,
     Matched = 1000
 };
 
 // --- Global Counters ---
-int next_capture_id = 1; // Start from 1 for capture groups (\1, \2, etc.)
+int next_capture_id = 1;
 int listid = 0;
 
 // --- Utility Functions ---
@@ -121,34 +120,34 @@ Fragment parse_primary(std::string_view& rx) {
             break;
         }
         case '(': {
-            // Create capture group
+            // Create capture group with proper start/end states
             int current_capture_id = next_capture_id++;
             
-            // Create start capture state
-            auto start_capture = std::make_shared<State>();
-            start_capture->c = Epsilon;
-            start_capture->capture_start = current_capture_id;
+            // Create capture start state
+            auto start_state = std::make_shared<State>();
+            start_state->c = Split;  // Use Split as epsilon-like transition
+            start_state->capture_start = current_capture_id;
             
-            // Parse the inner expression
-            Fragment inner_frag = parse(rx, parse_primary(rx), 0);
+            // Parse inner content
+            Fragment inner = parse(rx, parse_primary(rx), 0);
             
             if (rx.empty() || rx.front() != ')') {
                 throw std::runtime_error("Expected ')' to close group");
             }
             rx.remove_prefix(1);
             
-            // Create end capture state
-            auto end_capture = std::make_shared<State>();
-            end_capture->c = Epsilon;
-            end_capture->capture_end = current_capture_id;
+            // Create capture end state
+            auto end_state = std::make_shared<State>();
+            end_state->c = Split;
+            end_state->capture_end = current_capture_id;
             
-            // Connect: start_capture -> inner_frag -> end_capture
-            start_capture->out = inner_frag.start;
-            for (auto o : inner_frag.out) {
-                *o = end_capture;
+            // Wire together: start_state -> inner -> end_state
+            start_state->out = inner.start;
+            for (auto o : inner.out) {
+                *o = end_state;
             }
             
-            frag = { start_capture, { &end_capture->out } };
+            frag = { start_state, { &end_state->out } };
             break;
         }
         default:
@@ -256,7 +255,7 @@ std::shared_ptr<State> regex2nfa(std::string_view rx_str) {
     if (rx_str.empty()) return matched;
 
     std::string_view current_rx = rx_str;
-    next_capture_id = 1; // Reset for each regex
+    next_capture_id = 1;
 
     Fragment frag = parse(current_rx, parse_primary(current_rx), 0);
 
@@ -273,60 +272,71 @@ std::shared_ptr<State> regex2nfa(std::string_view rx_str) {
     return frag.start;
 }
 
-// --- NFA Simulation ---
+// --- NFA Simulation with Captures ---
 struct CaptureInfo {
-    std::map<int, std::string> groups; // capture_id -> captured string
-    std::map<int, size_t> backref_pos; // For tracking position in backreference matching
+    std::map<int, std::string> groups;
+    std::map<int, int> backref_pos;  // Position in backreference matching
+    
+    bool operator<(const CaptureInfo& other) const {
+        if (groups != other.groups) return groups < other.groups;
+        return backref_pos < other.backref_pos;
+    }
 };
 
-using List = std::vector<std::pair<CaptureInfo, std::shared_ptr<State>>>;
+struct NFAState {
+    std::shared_ptr<State> state;
+    CaptureInfo captures;
+    
+    bool operator<(const NFAState& other) const {
+        if (state != other.state) return state < other.state;
+        return captures < other.captures;
+    }
+};
+
+using List = std::vector<NFAState>;
 
 bool ismatch(const List& l) {
-    return std::any_of(l.begin(), l.end(), [](const auto& p) {
-        return p.second->c == Matched;
+    return std::any_of(l.begin(), l.end(), [](const NFAState& ns) {
+        return ns.state->c == Matched;
     });
 }
 
-void addstate(std::shared_ptr<State> s, CaptureInfo cap_info, List& l) {
-    if (!s || s->lastlist == listid) return;
-
-    s->lastlist = listid;
+void addstate(std::shared_ptr<State> s, CaptureInfo cap_info, List& l, std::set<std::shared_ptr<State>>& visited) {
+    if (!s || visited.count(s)) return;
+    visited.insert(s);
 
     // Handle capture start/end
     if (s->capture_start >= 0) {
-        cap_info.groups[s->capture_start] = ""; // Initialize empty capture
+        cap_info.groups[s->capture_start] = "";
         cap_info.backref_pos[s->capture_start] = 0;
     }
     
     if (s->capture_end >= 0) {
-        // Capture group ended - no special action needed here
-        // The captured content is already in cap_info.groups
+        // End of capture - the content is already in the group
     }
 
     if (s->c == Split) {
-        addstate(s->out, cap_info, l);
-        addstate(s->out1, cap_info, l);
-        return;
-    } else if (s->c == Epsilon) {
-        addstate(s->out, cap_info, l);
+        addstate(s->out, cap_info, l, visited);
+        addstate(s->out1, cap_info, l, visited);
         return;
     }
 
-    l.push_back({ cap_info, s });
+    l.push_back({ s, cap_info });
 }
 
-void startlist(std::shared_ptr<State> s, List& l) {
-    listid++;
+void startlist(std::shared_ptr<State> start, List& l) {
     l.clear();
+    std::set<std::shared_ptr<State>> visited;
     CaptureInfo cap{};
-    addstate(s, cap, l);
+    addstate(start, cap, l, visited);
 }
 
-void match_step(List& cl, char c, List& nl) {
-    listid++;
+void match_step(List& cl, char c, List& nl, const std::string& full_text, size_t pos) {
     nl.clear();
-
-    for (auto [cap_info, s] : cl) {
+    
+    for (const NFAState& ns : cl) {
+        auto s = ns.state;
+        auto cap_info = ns.captures;
         bool should_advance = false;
         
         switch (s->c) {
@@ -352,27 +362,28 @@ void match_step(List& cl, char c, List& nl) {
                     // Handle backreference
                     int backref_id = s->c - BackRefStart;
                     
-                    if (cap_info.groups.count(backref_id) && !cap_info.groups[backref_id].empty()) {
+                    if (cap_info.groups.count(backref_id)) {
                         const std::string& captured = cap_info.groups[backref_id];
-                        size_t pos = cap_info.backref_pos[backref_id];
+                        int pos_in_ref = cap_info.backref_pos[backref_id];
                         
-                        if (pos < captured.length() && captured[pos] == c) {
+                        if (!captured.empty() && pos_in_ref < captured.length() && captured[pos_in_ref] == c) {
                             cap_info.backref_pos[backref_id]++;
                             
                             if (cap_info.backref_pos[backref_id] >= captured.length()) {
-                                // Finished matching the backreference
+                                // Finished matching backreference
                                 cap_info.backref_pos[backref_id] = 0;
                                 should_advance = true;
                             } else {
-                                // Still matching backreference, stay in same state
-                                // Update captures for any active groups
-                                for (auto& [group_id, group_content] : cap_info.groups) {
-                                    if (group_content.length() > 0) { // Only update if group is active
-                                        // Check if we need to add this character to active captures
-                                        // This is a simplified approach - in practice you'd track which groups are currently active
+                                // Continue matching backreference
+                                // Add character to active captures
+                                for (auto& [gid, content] : cap_info.groups) {
+                                    // Only add to groups that we're currently inside
+                                    // This is a simplification - we should track active groups properly
+                                    if (gid != backref_id) {  // Don't modify the group we're referencing
+                                        cap_info.groups[gid] += c;
                                     }
                                 }
-                                addstate(s, cap_info, nl);
+                                nl.push_back({ s, cap_info });
                                 continue;
                             }
                         }
@@ -382,44 +393,46 @@ void match_step(List& cl, char c, List& nl) {
         }
         
         if (should_advance) {
-            // Add character to all currently active capture groups
-            for (auto& [group_id, group_content] : cap_info.groups) {
-                // Simple heuristic: if the group is initialized (exists in map), add character
-                // This is simplified - a full implementation would track active capture state more precisely
-                if (cap_info.groups.count(group_id)) {
-                    cap_info.groups[group_id] += c;
-                }
+            // Add character to all active capture groups
+            // This is simplified - we should track which groups are currently active
+            for (auto& [group_id, content] : cap_info.groups) {
+                // Add to groups that exist and are presumably active
+                cap_info.groups[group_id] += c;
             }
             
-            addstate(s->out, cap_info, nl);
+            std::set<std::shared_ptr<State>> visited;
+            addstate(s->out, cap_info, nl, visited);
         }
     }
 }
 
 int matchEpsilonNFA(std::shared_ptr<State> start, std::string_view text) {
     List cl, nl;
-
-    bool match_from_start = false;
-    listid++;
-    CaptureInfo initial_cap{};
     
+    bool match_from_start = false;
     if (start->c == MatchStart) {
         match_from_start = true;
-        addstate(start->out, initial_cap, cl);
+        std::set<std::shared_ptr<State>> visited;
+        CaptureInfo initial_cap{};
+        addstate(start->out, initial_cap, cl, visited);
     } else {
-        addstate(start, initial_cap, cl);
+        startlist(start, cl);
     }
 
+    std::string text_str(text);  // Convert to string for easier handling
+    
     for (size_t text_idx = 0; text_idx <= text.length(); ++text_idx) {
         char current_char = (text_idx < text.length()) ? text[text_idx] : '\0';
 
+        // Handle end anchor
         if (current_char == '\0') {
             List final_cl;
-            for (auto [cap_info, s] : cl) {
-                if (s->c == MatchEnd) {
-                    addstate(s->out, cap_info, final_cl);
+            for (const NFAState& ns : cl) {
+                if (ns.state->c == MatchEnd) {
+                    std::set<std::shared_ptr<State>> visited;
+                    addstate(ns.state->out, ns.captures, final_cl, visited);
                 } else {
-                    final_cl.push_back({cap_info, s});
+                    final_cl.push_back(ns);
                 }
             }
             if (ismatch(final_cl)) {
@@ -427,28 +440,28 @@ int matchEpsilonNFA(std::shared_ptr<State> start, std::string_view text) {
             }
         }
 
-        if (!match_from_start && cl.empty()) {
-            startlist(start, cl);
-        } else if (text_idx == 0 && !match_from_start && cl.empty() && start->c != MatchStart) {
+        // Restart matching if needed
+        if (!match_from_start && cl.empty() && text_idx < text.length()) {
             startlist(start, cl);
         }
 
-        if (!cl.empty()) {
-            if (text_idx < text.length()) {
-                match_step(cl, current_char, nl);
-                std::swap(cl, nl);
-            }
+        if (!cl.empty() && text_idx < text.length()) {
+            match_step(cl, current_char, nl, text_str, text_idx);
+            std::swap(cl, nl);
         }
 
         if (ismatch(cl)) {
             return 1;
         }
 
+        // Try starting new match from current position
         if (cl.empty() && !match_from_start && text_idx < text.length()) {
             startlist(start, cl);
-            match_step(cl, current_char, nl);
-            std::swap(cl, nl);
-            if (ismatch(cl)) return 1;
+            if (!cl.empty()) {
+                match_step(cl, current_char, nl, text_str, text_idx);
+                std::swap(cl, nl);
+                if (ismatch(cl)) return 1;
+            }
         }
     }
 
