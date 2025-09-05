@@ -120,15 +120,12 @@ Fragment parse_primary(std::string_view& rx) {
             break;
         }
         case '(': {
-            // Create capture group with proper start/end states
             int current_capture_id = next_capture_id++;
 
-            // Create capture start state (epsilon-like)
             auto start_state = std::make_shared<State>();
             start_state->c = Split;
             start_state->capture_start = current_capture_id;
 
-            // Parse inner content
             Fragment inner = parse(rx, parse_primary(rx), 0);
 
             if (rx.empty() || rx.front() != ')') {
@@ -136,12 +133,10 @@ Fragment parse_primary(std::string_view& rx) {
             }
             rx.remove_prefix(1);
 
-            // Create capture end state (epsilon-like)
             auto end_state = std::make_shared<State>();
             end_state->c = Split;
             end_state->capture_end = current_capture_id;
 
-            // Wire together: start_state -> inner -> end_state
             start_state->out = inner.start;
             for (auto o : inner.out) {
                 *o = end_state;
@@ -154,7 +149,6 @@ Fragment parse_primary(std::string_view& rx) {
             state->c = c;
     }
 
-    // Handle quantifiers
     if (!rx.empty()) {
         switch (rx.front()) {
             case '*': {
@@ -274,9 +268,9 @@ std::shared_ptr<State> regex2nfa(std::string_view rx_str) {
 
 // --- NFA Simulation with Captures ---
 struct CaptureInfo {
-    std::map<int, std::string> groups;     // capture_id -> captured text
-    std::map<int, bool> active;            // capture_id -> currently active?
-    std::map<int, size_t> backref_pos;     // capture_id -> progress while matching a backref
+    std::map<int, std::string> groups;
+    std::map<int, bool> active;
+    std::map<int, size_t> backref_pos;
 
     bool operator<(const CaptureInfo& other) const {
         if (groups != other.groups) return groups < other.groups;
@@ -307,7 +301,6 @@ void addstate(std::shared_ptr<State> s, CaptureInfo cap_info, List& l, std::set<
     if (!s || visited.count(s)) return;
     visited.insert(s);
 
-    // Toggle capture start/end on epsilon-like nodes
     if (s->capture_start >= 0) {
         int gid = s->capture_start;
         cap_info.groups[gid].clear();
@@ -339,9 +332,10 @@ void match_step(List& cl, char c, List& nl) {
 
     for (const NFAState& ns : cl) {
         auto s = ns.state;
-        auto cap = ns.captures; // copy per-path
+        auto cap = ns.captures;
 
         bool should_advance = false;
+        bool appended_in_backref = false;
         int backref_id = -1;
 
         switch (s->c) {
@@ -364,7 +358,6 @@ void match_step(List& cl, char c, List& nl) {
                 if (s->c == c) {
                     should_advance = true;
                 } else if (s->c >= BackRefStart) {
-                    // Backreference matching
                     backref_id = s->c - BackRefStart;
                     auto it = cap.groups.find(backref_id);
                     if (it != cap.groups.end()) {
@@ -373,10 +366,10 @@ void match_step(List& cl, char c, List& nl) {
                             size_t pos = cap.backref_pos[backref_id];
                             if (pos < captured.size() && captured[pos] == c) {
                                 pos++;
-                                // Append to all active groups (so outer captures see backref text)
                                 for (auto &p : cap.active) {
                                     if (p.second) cap.groups[p.first].push_back(c);
                                 }
+                                appended_in_backref = true;
                                 if (pos == captured.size()) {
                                     cap.backref_pos[backref_id] = 0;
                                     should_advance = true;
@@ -393,9 +386,11 @@ void match_step(List& cl, char c, List& nl) {
         }
 
         if (should_advance) {
-            for (auto& [gid, isActive] : cap.active) {
-                if (isActive) {
-                    cap.groups[gid].push_back(c);
+            if (!appended_in_backref) {
+                for (auto& [gid, isActive] : cap.active) {
+                    if (isActive) {
+                        cap.groups[gid].push_back(c);
+                    }
                 }
             }
 
