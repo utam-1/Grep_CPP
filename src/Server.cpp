@@ -67,6 +67,7 @@ std::vector<std::string> find_files_recursively(fs::path dir) {
 }
 
 // Forward declaration
+struct Fragment;
 Fragment parse(std::string_view&, Fragment, int);
 
 // --- NFA Construction ---
@@ -341,7 +342,6 @@ void match_step(List& cl, char c, List& nl) {
         auto cap = ns.captures; // copy per-path
 
         bool should_advance = false;
-        bool is_backref = false;
         int backref_id = -1;
 
         switch (s->c) {
@@ -365,7 +365,6 @@ void match_step(List& cl, char c, List& nl) {
                     should_advance = true;
                 } else if (s->c >= BackRefStart) {
                     // Backreference matching
-                    is_backref = true;
                     backref_id = s->c - BackRefStart;
                     auto it = cap.groups.find(backref_id);
                     if (it != cap.groups.end()) {
@@ -374,31 +373,26 @@ void match_step(List& cl, char c, List& nl) {
                             size_t pos = cap.backref_pos[backref_id];
                             if (pos < captured.size() && captured[pos] == c) {
                                 pos++;
+                                // Append to all active groups (so outer captures see backref text)
+                                for (auto &p : cap.active) {
+                                    if (p.second) cap.groups[p.first].push_back(c);
+                                }
                                 if (pos == captured.size()) {
-                                    // Completed the backreference; reset progress and advance to next state
                                     cap.backref_pos[backref_id] = 0;
                                     should_advance = true;
                                 } else {
-                                    // Stay on this state and continue matching next char
                                     cap.backref_pos[backref_id] = pos;
-                                    // Do not add to captures while matching a backreference
-                                    // Stay
                                     nl.push_back({ s, cap });
                                     continue;
                                 }
-                            } else {
-                                // Mismatch on backreference -> this path dies
                             }
                         }
-                        // empty captured string -> treat as mismatch (can't match anything)
                     }
-                    // group not captured -> mismatch
                 }
                 break;
         }
 
         if (should_advance) {
-            // Append consumed character to all *active* groups only (not to all)
             for (auto& [gid, isActive] : cap.active) {
                 if (isActive) {
                     cap.groups[gid].push_back(c);
@@ -425,9 +419,7 @@ int matchEpsilonNFA(std::shared_ptr<State> start, std::string_view text) {
 
     const size_t N = text.size();
     for (size_t i = 0; i <= N; ++i) {
-        // If we've consumed all input, try to satisfy end-anchor and Matched
         if (i == N) {
-            // Process end-anchor transitions
             List after_end;
             for (const auto& ns : cl) {
                 if (ns.state->c == MatchEnd) {
@@ -444,7 +436,6 @@ int matchEpsilonNFA(std::shared_ptr<State> start, std::string_view text) {
 
         char c = text[i];
 
-        // If no states are active (and not anchored), restart from next position
         if (cl.empty() && !anchored_at_start) {
             startlist(start, cl);
         }
@@ -458,7 +449,6 @@ int matchEpsilonNFA(std::shared_ptr<State> start, std::string_view text) {
             return 1;
         }
 
-        // If match failed and not anchored, try starting from next character
         if (cl.empty() && !anchored_at_start) {
             startlist(start, cl);
             if (!cl.empty()) {
