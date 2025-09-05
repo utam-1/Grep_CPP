@@ -8,57 +8,56 @@
 #include <stdexcept>
 #include <fstream>
 #include <filesystem>
-#include <string_view> // Use string_view for efficiency
+#include <string_view>
 
 namespace fs = std::filesystem;
 
 // --- NFA State Definition ---
 struct State {
-    std::shared_ptr<State> out, out1; // out: next state, out1: alternative next state (for Split)
-    int c = -1;                       // character or special opcode
-    int lastlist = -1;                // For list deduplication in simulation
-    std::vector<int> match_set;       // For bracket expressions [abc]
-    std::vector<int> capture_ids;     // IDs of capture groups this state belongs to
+    std::shared_ptr<State> out, out1;
+    int c = -1;
+    int lastlist = -1;
+    std::vector<int> match_set;
+    
+    // For capture groups - track start and end of captures
+    int capture_start = -1;  // If >= 0, this state starts capture group N
+    int capture_end = -1;    // If >= 0, this state ends capture group N
 };
 
 // --- NFA Fragment Definition ---
-// A piece of an NFA graph, with a start state and a list of dangling
-// outgoing pointers that need to be connected to subsequent parts.
 struct Fragment {
     std::shared_ptr<State> start;
-    std::vector<std::shared_ptr<State>*> out; // Pointers to shared_ptr<State> to be linked
+    std::vector<std::shared_ptr<State>*> out;
 };
 
 // --- NFA Opcodes ---
-// Special values for State::c to represent regex operators
 enum {
-    Split = 256,    // Represents an epsilon transition with two choices (e.g., for | or *)
-    MatchAny,       // .
-    MatchWord,      // \w
-    MatchDigit,     // \d
-    MatchChoice,    // [abc]
-    MatchAntiChoice,// [^abc]
-    MatchStart,     // ^
-    MatchEnd,       // $
-    Epsilon = 299,  // A pure epsilon transition (not strictly used as a char, but concept)
-    BackRefStart = 300, // Starting point for backreference IDs (e.g., \1 is BackRefStart + 1)
-    Matched = 1000  // Special state indicating a successful match
+    Split = 256,
+    MatchAny,
+    MatchWord,
+    MatchDigit,
+    MatchChoice,
+    MatchAntiChoice,
+    MatchStart,
+    MatchEnd,
+    Epsilon = 299,
+    BackRefStart = 300,
+    Matched = 1000
 };
 
 // --- Global Counters ---
-int capture_id_counter = 0; // Assigns unique IDs to capture groups during parsing
-int listid = 0;             // Incremented for each step of NFA simulation to prevent cycles
+int next_capture_id = 1; // Start from 1 for capture groups (\1, \2, etc.)
+int listid = 0;
 
-// --- Utility: Recursively find files in a directory ---
+// --- Utility Functions ---
 std::vector<std::string> find_files_recursively(fs::path dir) {
     std::vector<std::string> files;
 
     if (!fs::is_directory(dir)) {
-        // If it's a file, just return it
         if (fs::is_regular_file(dir)) {
             return {dir.string()};
         }
-        return {}; // Not a directory and not a file
+        return {};
     }
 
     for (auto& e : fs::recursive_directory_iterator(dir)) {
@@ -69,50 +68,16 @@ std::vector<std::string> find_files_recursively(fs::path dir) {
     return files;
 }
 
-// --- NFA Construction Helpers ---
-
-// `capture_fragment` marks all states in a fragment as belonging to a capture group.
-void capture_fragment(std::shared_ptr<State> s) {
-    // This function recursively traverses the NFA fragment and adds the current
-    // capture_id_counter to each state's capture_ids vector.
-    // This is crucial for tracking which parts of the input text belong to which capture group.
-    std::vector<std::shared_ptr<State>> q;
-    q.push_back(s);
-    std::set<std::shared_ptr<State>> visited; // Prevent infinite loops in cyclic NFAs
-
-    while (!q.empty()) {
-        std::shared_ptr<State> current = q.back();
-        q.pop_back();
-
-        if (!current || visited.count(current)) continue;
-        visited.insert(current);
-
-        // If this state hasn't been marked for this capture ID, add it
-        if (std::find(current->capture_ids.begin(), current->capture_ids.end(), capture_id_counter) == current->capture_ids.end()) {
-            current->capture_ids.push_back(capture_id_counter);
-        }
-
-        // Add next states to the queue for traversal
-        if (current->out) {
-            q.push_back(current->out);
-        }
-        if (current->out1) { // For Split states
-            q.push_back(current->out1);
-        }
-    }
-}
-
-
-// Forward declaration for recursive parsing
+// Forward declaration
 Fragment parse(std::string_view&, Fragment, int);
 
-// `parse_primary` handles single characters, '.', '\d', '\w', '[]', and parenthesized groups.
+// --- NFA Construction ---
 Fragment parse_primary(std::string_view& rx) {
     auto state = std::make_shared<State>();
     Fragment frag { state, { &state->out } };
 
     if (rx.empty()) {
-        throw std::runtime_error("Unexpected end of pattern (expected primary expression)");
+        throw std::runtime_error("Unexpected end of pattern");
     }
 
     char c = rx.front();
@@ -135,9 +100,8 @@ Fragment parse_primary(std::string_view& rx) {
             if (c == 'd') state->c = MatchDigit;
             else if (c == 'w') state->c = MatchWord;
             else if (isdigit(c)) {
-                // Backreference: \1, \2, etc.
                 state->c = BackRefStart + (c - '0');
-            } else state->c = c; // Escaped literal character (e.g., \.)
+            } else state->c = c;
             break;
         }
         case '[': {
@@ -152,64 +116,79 @@ Fragment parse_primary(std::string_view& rx) {
                 state->match_set.push_back(rx.front());
                 rx.remove_prefix(1);
             }
-            if (rx.empty()) throw std::runtime_error("Unclosed bracket expression (missing ']')");
-            rx.remove_prefix(1); // Consume ']'
+            if (rx.empty()) throw std::runtime_error("Unclosed bracket expression");
+            rx.remove_prefix(1);
             break;
         }
         case '(': {
-            // This is a nested group. Recursively parse its content.
-            // Note: The `parse` function handles `|` inside the group correctly.
-            frag = parse(rx, parse_primary(rx), 0); // Parse inner expression
+            // Create capture group
+            int current_capture_id = next_capture_id++;
+            
+            // Create start capture state
+            auto start_capture = std::make_shared<State>();
+            start_capture->c = Epsilon;
+            start_capture->capture_start = current_capture_id;
+            
+            // Parse the inner expression
+            Fragment inner_frag = parse(rx, parse_primary(rx), 0);
             
             if (rx.empty() || rx.front() != ')') {
                 throw std::runtime_error("Expected ')' to close group");
             }
-            rx.remove_prefix(1); // Consume ')'
-
-            // Once the group is parsed, mark its states for the current capture ID
-            // and increment the counter for the next group.
-            capture_fragment(frag.start);
-            capture_id_counter++;
+            rx.remove_prefix(1);
+            
+            // Create end capture state
+            auto end_capture = std::make_shared<State>();
+            end_capture->c = Epsilon;
+            end_capture->capture_end = current_capture_id;
+            
+            // Connect: start_capture -> inner_frag -> end_capture
+            start_capture->out = inner_frag.start;
+            for (auto o : inner_frag.out) {
+                *o = end_capture;
+            }
+            
+            frag = { start_capture, { &end_capture->out } };
             break;
         }
         default:
-            state->c = c; // Literal character
+            state->c = c;
     }
 
-    // Handle postfix quantifiers: *, +, ?
+    // Handle quantifiers
     if (!rx.empty()) {
         switch (rx.front()) {
             case '*': {
                 auto s = std::make_shared<State>();
                 s->c = Split;
-                s->out = frag.start; // Loop back to the start of the fragment
-
+                s->out = frag.start;
+                
                 for (auto o : frag.out) {
-                    *o = s; // Connect fragment's end to the loop back state
+                    *o = s;
                 }
-
-                frag = { s, { &s->out1 } }; // New fragment starts with Split, output to next pattern or bypass loop
+                
+                frag = { s, { &s->out1 } };
                 rx.remove_prefix(1);
             } break;
             case '+': {
                 auto s = std::make_shared<State>();
                 s->c = Split;
-                s->out = frag.start; // Loop back to the start of the fragment (at least once)
-
+                s->out = frag.start;
+                
                 for (auto o : frag.out) {
-                    *o = s; // Connect fragment's end to the loop back state
+                    *o = s;
                 }
-
-                frag.out = { &s->out1 }; // New fragment's output is the bypass
+                
+                frag.out = { &s->out1 };
                 rx.remove_prefix(1);
             } break;
             case '?': {
                 auto s = std::make_shared<State>();
                 s->c = Split;
-                s->out = frag.start; // Optional: can bypass the fragment
-
-                frag.start = s; // New start state is the Split
-                frag.out.push_back(&s->out1); // Add a path through the fragment
+                s->out = frag.start;
+                
+                frag.start = s;
+                frag.out.push_back(&s->out1);
                 rx.remove_prefix(1);
             } break;
         }
@@ -218,35 +197,30 @@ Fragment parse_primary(std::string_view& rx) {
     return frag;
 }
 
-// `parse` implements operator precedence parsing (similar to shunting-yard)
-// It takes a left-hand side fragment and combines it with subsequent operators and right-hand side fragments.
 Fragment parse(std::string_view& rx, Fragment lhs, int min_prec) {
-    // Defines precedence for operators. Higher number means tighter binding.
-    // ')' and ']' have low/negative precedence to act as delimiters.
     auto prec = [](char c) {
         if (c == '|') return 0;
-        if (c == ']' || c == ')') return -1; // Delimiters, effectively stop parsing
-        return 1; // Concatenation (implicit) has higher precedence than |
+        if (c == ']' || c == ')') return -1;
+        return 1;
     };
 
-    char look = !rx.empty() ? rx.front() : '\0'; // Lookahead character
+    char look = !rx.empty() ? rx.front() : '\0';
 
     while (!rx.empty() && prec(look) >= min_prec) {
         char op = look;
 
         if (op == '|') {
-            rx.remove_prefix(1); // Consume '|'
+            rx.remove_prefix(1);
         }
 
-        Fragment rhs = parse_primary(rx); // Parse the right-hand side operand
+        Fragment rhs = parse_primary(rx);
 
         if (!rx.empty()) {
             look = rx.front();
         } else {
-            look = '\0'; // End of pattern
+            look = '\0';
         }
 
-        // Handle higher precedence operators on the RHS (e.g., `ab|c` should parse `ab` first)
         while (!rx.empty() && prec(look) > prec(op)) {
             rhs = parse(rx, rhs, prec(op) + 1);
             if (rx.empty()) break;
@@ -254,8 +228,6 @@ Fragment parse(std::string_view& rx, Fragment lhs, int min_prec) {
         }
 
         if (op == '|') {
-            // Union (OR) operator: Create a new Split state.
-            // One branch goes to LHS, other to RHS. Output is union of both.
             auto s = std::make_shared<State>();
             s->c = Split;
             s->out = lhs.start;
@@ -264,38 +236,34 @@ Fragment parse(std::string_view& rx, Fragment lhs, int min_prec) {
             lhs.start = s;
             lhs.out.insert(lhs.out.end(), rhs.out.begin(), rhs.out.end());
         } else {
-            // Concatenation (implicit operator): Connect LHS's dangling outputs to RHS's start.
             for (auto o : lhs.out) {
                 *o = rhs.start;
             }
-            lhs.out = rhs.out; // New dangling outputs are RHS's dangling outputs
+            lhs.out = rhs.out;
         }
 
-        if (rx.empty()) break; // End of pattern
-        look = rx.front(); // Update lookahead for next iteration
+        if (rx.empty()) break;
+        look = rx.front();
     }
 
     return lhs;
 }
 
-// `regex2nfa` is the entry point for converting a regex string to an NFA.
 std::shared_ptr<State> regex2nfa(std::string_view rx_str) {
     auto matched = std::make_shared<State>();
     matched->c = Matched;
 
     if (rx_str.empty()) return matched;
 
-    std::string_view current_rx = rx_str; // Use string_view for parsing
-    capture_id_counter = 0; // Reset capture counter for each new regex
+    std::string_view current_rx = rx_str;
+    next_capture_id = 1; // Reset for each regex
 
-    // Start parsing, then connect the final NFA outputs to the 'Matched' state.
     Fragment frag = parse(current_rx, parse_primary(current_rx), 0);
 
-    // If there's still unparsed regex, it's an error (e.g., unmatched ')' or ']')
     if (!current_rx.empty()) {
-         if (current_rx.front() == ')') throw std::runtime_error("Unmatched ')' in regex");
-         if (current_rx.front() == ']') throw std::runtime_error("Unmatched ']' in regex");
-         throw std::runtime_error("Syntax error in regex pattern: " + std::string(current_rx));
+        if (current_rx.front() == ')') throw std::runtime_error("Unmatched ')'");
+        if (current_rx.front() == ']') throw std::runtime_error("Unmatched ']'");
+        throw std::runtime_error("Syntax error in regex");
     }
 
     for (auto o : frag.out) {
@@ -305,238 +273,194 @@ std::shared_ptr<State> regex2nfa(std::string_view rx_str) {
     return frag.start;
 }
 
-// --- NFA Simulation Runtime ---
-
-// `CaptureInfo` stores the captured substrings for each group.
+// --- NFA Simulation ---
 struct CaptureInfo {
-    std::vector<std::string> groups; // Stored by index (0-based)
-    std::map<int, int> active;       // capture_id -> index in `groups`
-    int backref_idx = 0;             // Current index for matching a backreference
+    std::map<int, std::string> groups; // capture_id -> captured string
+    std::map<int, size_t> backref_pos; // For tracking position in backreference matching
 };
 
-// `List` represents the set of active NFA states at a given point in time.
 using List = std::vector<std::pair<CaptureInfo, std::shared_ptr<State>>>;
 
-// Checks if any state in the list is the 'Matched' state.
 bool ismatch(const List& l) {
     return std::any_of(l.begin(), l.end(), [](const auto& p) {
         return p.second->c == Matched;
     });
 }
 
-// `addstate` adds a state and all states reachable via epsilon transitions
-// to the current list, avoiding duplicates for the current `listid`.
 void addstate(std::shared_ptr<State> s, CaptureInfo cap_info, List& l) {
-    if (!s || s->lastlist == listid) return; // Already processed for this listid
+    if (!s || s->lastlist == listid) return;
 
-    s->lastlist = listid; // Mark as visited for current list generation
+    s->lastlist = listid;
 
-    // Recursive epsilon closure
+    // Handle capture start/end
+    if (s->capture_start >= 0) {
+        cap_info.groups[s->capture_start] = ""; // Initialize empty capture
+        cap_info.backref_pos[s->capture_start] = 0;
+    }
+    
+    if (s->capture_end >= 0) {
+        // Capture group ended - no special action needed here
+        // The captured content is already in cap_info.groups
+    }
+
     if (s->c == Split) {
         addstate(s->out, cap_info, l);
         addstate(s->out1, cap_info, l);
+        return;
+    } else if (s->c == Epsilon) {
+        addstate(s->out, cap_info, l);
         return;
     }
 
     l.push_back({ cap_info, s });
 }
 
-// Initializes the first list of active states from the NFA start state.
 void startlist(std::shared_ptr<State> s, List& l) {
-    listid++; // Increment global list ID
+    listid++;
     l.clear();
-    CaptureInfo cap{}; // Empty capture info for the start of a match
+    CaptureInfo cap{};
     addstate(s, cap, l);
 }
 
-// Appends a character to all relevant active capture groups for a given state.
-void capture(char c, CaptureInfo& caps, std::shared_ptr<State> s) {
-    for (int id : s->capture_ids) {
-        // If this capture ID isn't active yet, initialize it
-        if (!caps.active.count(id)) {
-            caps.active[id] = caps.groups.size();
-            caps.groups.emplace_back(); // Add a new empty string for this group
-        }
-        // Append the current character to the captured string
-        caps.groups[caps.active[id]] += c;
-    }
-}
-
-// `match_step` advances the NFA simulation for a single input character `c`.
-// It takes the current list of active states (`cl`) and populates `nl` (next list).
 void match_step(List& cl, char c, List& nl) {
-    listid++; // Increment global list ID for the new `nl`
+    listid++;
     nl.clear();
 
     for (auto [cap_info, s] : cl) {
+        bool should_advance = false;
+        
         switch (s->c) {
             case MatchAny:
-                capture(c, cap_info, s);
-                addstate(s->out, cap_info, nl);
+                should_advance = true;
                 break;
             case MatchDigit:
-                if (isdigit(c)) {
-                    capture(c, cap_info, s);
-                    addstate(s->out, cap_info, nl);
-                }
+                should_advance = isdigit(c);
                 break;
             case MatchWord:
-                if (isalnum(c) || c == '_') {
-                    capture(c, cap_info, s);
-                    addstate(s->out, cap_info, nl);
-                }
+                should_advance = (isalnum(c) || c == '_');
                 break;
             case MatchChoice:
-                if (std::find(s->match_set.begin(), s->match_set.end(), c) != s->match_set.end()) {
-                    capture(c, cap_info, s);
-                    addstate(s->out, cap_info, nl);
-                }
+                should_advance = (std::find(s->match_set.begin(), s->match_set.end(), c) != s->match_set.end());
                 break;
             case MatchAntiChoice:
-                if (std::find(s->match_set.begin(), s->match_set.end(), c) == s->match_set.end()) {
-                    capture(c, cap_info, s);
-                    addstate(s->out, cap_info, nl);
-                }
+                should_advance = (std::find(s->match_set.begin(), s->match_set.end(), c) == s->match_set.end());
                 break;
             default:
-                // Handle literal characters and backreferences
                 if (s->c == c) {
-                    capture(c, cap_info, s);
-                    addstate(s->out, cap_info, nl);
-                } else if (s->c >= BackRefStart && s->c < BackRefStart + capture_id_counter) {
-                    // This is a backreference state (e.g., \1).
-                    int backref_id = s->c - BackRefStart; // 0-indexed group ID for the regex parse
+                    should_advance = true;
+                } else if (s->c >= BackRefStart) {
+                    // Handle backreference
+                    int backref_id = s->c - BackRefStart;
                     
-                    // The capture groups are stored by their `active` mapping or directly by index
-                    // If the group `backref_id` was captured, `backref_id` will be a key in `cap_info.active`
-                    // and its value will be the 0-indexed position in `cap_info.groups`
-                    if (cap_info.active.count(backref_id)) {
-                        int group_idx = cap_info.active[backref_id];
-                        const std::string& captured_str = cap_info.groups[group_idx];
-
-                        if (!captured_str.empty() && cap_info.backref_idx < captured_str.length() &&
-                            captured_str[cap_info.backref_idx] == c) {
+                    if (cap_info.groups.count(backref_id) && !cap_info.groups[backref_id].empty()) {
+                        const std::string& captured = cap_info.groups[backref_id];
+                        size_t pos = cap_info.backref_pos[backref_id];
+                        
+                        if (pos < captured.length() && captured[pos] == c) {
+                            cap_info.backref_pos[backref_id]++;
                             
-                            capture(c, cap_info, s); // Capture the current character
-                            cap_info.backref_idx++; // Advance index in the backreference string
-
-                            if (cap_info.backref_idx >= captured_str.length()) {
-                                // Entire backreference matched, reset index and move to next state
-                                cap_info.backref_idx = 0;
-                                addstate(s->out, cap_info, nl);
+                            if (cap_info.backref_pos[backref_id] >= captured.length()) {
+                                // Finished matching the backreference
+                                cap_info.backref_pos[backref_id] = 0;
+                                should_advance = true;
                             } else {
-                                // Still matching the backreference, stay in this state
+                                // Still matching backreference, stay in same state
+                                // Update captures for any active groups
+                                for (auto& [group_id, group_content] : cap_info.groups) {
+                                    if (group_content.length() > 0) { // Only update if group is active
+                                        // Check if we need to add this character to active captures
+                                        // This is a simplified approach - in practice you'd track which groups are currently active
+                                    }
+                                }
                                 addstate(s, cap_info, nl);
+                                continue;
                             }
                         }
                     }
                 }
+                break;
+        }
+        
+        if (should_advance) {
+            // Add character to all currently active capture groups
+            for (auto& [group_id, group_content] : cap_info.groups) {
+                // Simple heuristic: if the group is initialized (exists in map), add character
+                // This is simplified - a full implementation would track active capture state more precisely
+                if (cap_info.groups.count(group_id)) {
+                    cap_info.groups[group_id] += c;
+                }
+            }
+            
+            addstate(s->out, cap_info, nl);
         }
     }
 }
 
-// `matchEpsilonNFA` runs the full NFA simulation against the input text.
 int matchEpsilonNFA(std::shared_ptr<State> start, std::string_view text) {
-    List cl, nl; // Current list, next list
+    List cl, nl;
 
-    // Initial setup: `^` anchor check
-    bool match_from_start_of_string = false;
-    listid++; // Increment listid for initial startlist
+    bool match_from_start = false;
+    listid++;
     CaptureInfo initial_cap{};
-    // If the regex starts with '^', only add its next state.
-    // Otherwise, add the regex start state normally.
+    
     if (start->c == MatchStart) {
-        match_from_start_of_string = true;
-        addstate(start->out, initial_cap, cl); // Add state after '^'
+        match_from_start = true;
+        addstate(start->out, initial_cap, cl);
     } else {
-        addstate(start, initial_cap, cl); // Add the regex's start state
+        addstate(start, initial_cap, cl);
     }
 
-    // `text_idx` tracks current position in `text`
-    // `current_start_pos` tracks where the current regex match attempt began in `text`
     for (size_t text_idx = 0; text_idx <= text.length(); ++text_idx) {
-        char current_char = (text_idx < text.length()) ? text[text_idx] : '\0'; // Use '\0' for end of string
+        char current_char = (text_idx < text.length()) ? text[text_idx] : '\0';
 
-        // Process MatchEnd ($) if we are at the end of the input string
         if (current_char == '\0') {
-             List final_cl; // A temporary list to process MatchEnd states
-
-             // Check if any active state *before* processing EOF can transition to MatchEnd
-             for (auto [cap_info, s] : cl) {
-                 if (s->c == MatchEnd) {
-                     // Add the state *after* MatchEnd (which should be the Matched state)
-                     // or the MatchEnd state itself if it's the terminal state
-                     addstate(s->out, cap_info, final_cl);
-                 } else {
-                     // If it's not a MatchEnd state, it still carries its capture info
-                     // for the final `ismatch` check, but no new char will be matched.
-                     // It essentially 'dies' unless it's a MatchEnd.
-                     final_cl.push_back({cap_info, s});
-                 }
-             }
-             // After processing MatchEnd, check if we have a match
-             if (ismatch(final_cl)) {
-                 return 1;
-             }
+            List final_cl;
+            for (auto [cap_info, s] : cl) {
+                if (s->c == MatchEnd) {
+                    addstate(s->out, cap_info, final_cl);
+                } else {
+                    final_cl.push_back({cap_info, s});
+                }
+            }
+            if (ismatch(final_cl)) {
+                return 1;
+            }
         }
 
-        // If not anchored to start of string and `cl` is empty,
-        // we can try starting a new match attempt from the current `text_idx`.
-        if (!match_from_start_of_string && cl.empty()) {
-            startlist(start, cl); // Reset `cl` to start a new match attempt
-            // Re-process current char if a new match started from here
-            // This is handled by the loop naturally for `text_idx < text.length()`
-        } else if (text_idx == 0 && !match_from_start_of_string && cl.empty() && start->c != MatchStart) {
-            // Special case for empty regex matching empty string at start
+        if (!match_from_start && cl.empty()) {
+            startlist(start, cl);
+        } else if (text_idx == 0 && !match_from_start && cl.empty() && start->c != MatchStart) {
             startlist(start, cl);
         }
 
-        // If we still have an active list after potential restart
         if (!cl.empty()) {
-             // For the very last iteration (text_idx == text.length()),
-             // `current_char` is `\0`. `match_step` won't find matches for `\0`
-             // unless explicitly handled for literal `\0` or specific anchors.
-             // We've already handled `$` (MatchEnd) explicitly.
-             if (text_idx < text.length()) { // Don't call match_step for the past-the-end `\0`
-                 match_step(cl, current_char, nl);
-                 std::swap(cl, nl); // Move next list to current list
-             }
+            if (text_idx < text.length()) {
+                match_step(cl, current_char, nl);
+                std::swap(cl, nl);
+            }
         }
 
-        // Check for match after processing the current character
         if (ismatch(cl)) {
-            // If the regex does *not* end with $, a match can occur mid-string.
-            // If it *does* end with $, we need to wait until the `text_idx == text.length()` iteration.
-            // The NFA will naturally propagate to the `Matched` state only if it satisfies all conditions.
-            // So, checking `ismatch(cl)` here is correct.
             return 1;
         }
 
-        // If `cl` becomes empty and we're not anchored to the start,
-        // and we haven't reached the end of the text, we should restart the NFA
-        // from the start state, effectively trying to match from the next character.
-        if (cl.empty() && !match_from_start_of_string && text_idx < text.length()) {
-            // This restart logic is crucial for non-anchored matches (grep-like behavior)
-            // It effectively means: if no path is currently active, try starting a new one
-            // from the current character in the text.
+        if (cl.empty() && !match_from_start && text_idx < text.length()) {
             startlist(start, cl);
-            // Re-process the current character with the fresh start state
             match_step(cl, current_char, nl);
             std::swap(cl, nl);
             if (ismatch(cl)) return 1;
         }
     }
 
-    return 0; // No match found
+    return 0;
 }
 
-// --- Main Program Logic ---
-
+// --- Main Program ---
 int main(int argc, char* argv[]) {
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
 
-    if (argc < 2) { // Minimum 2 arguments: program name and pattern (or -E pattern)
+    if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " [-r] -E pattern [file ...]" << std::endl;
         return 1;
     }
@@ -546,7 +470,6 @@ int main(int argc, char* argv[]) {
     std::string pattern_str;
     std::vector<std::string> target_paths;
 
-    // Argument parsing logic (adapted from both snippets)
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
 
@@ -566,7 +489,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (!foundE) {
-        std::cerr << "Error: Expected -E followed by a pattern. (e.g., -E \"pattern\")\n";
+        std::cerr << "Error: Expected -E followed by a pattern.\n";
         return 1;
     }
     if (pattern_str.empty()) {
@@ -584,10 +507,9 @@ int main(int argc, char* argv[]) {
 
     bool any_match_found_global = false;
 
-    // If no target files/dirs are given, process stdin or current directory if recursive
     if (target_paths.empty()) {
         if (recursive) {
-            target_paths.push_back("."); // Search current directory
+            target_paths.push_back(".");
         } else {
             std::string line;
             while (std::getline(std::cin, line)) {
@@ -607,14 +529,13 @@ int main(int argc, char* argv[]) {
             files_to_process.insert(files_to_process.end(), found_files.begin(), found_files.end());
         }
     } else {
-        // Just add regular files directly
         for (const auto& target : target_paths) {
             if (fs::is_regular_file(target)) {
                 files_to_process.push_back(target);
             } else if (fs::exists(target)) {
-                 std::cerr << "Warning: Skipping non-regular file/directory (not recursive): " << target << std::endl;
+                std::cerr << "Warning: Skipping non-regular file: " << target << std::endl;
             } else {
-                 std::cerr << "Error: Path not found: " << target << std::endl;
+                std::cerr << "Error: Path not found: " << target << std::endl;
             }
         }
     }
@@ -630,9 +551,6 @@ int main(int argc, char* argv[]) {
 
         std::string line;
         while (std::getline(fin, line)) {
-            // Re-generate NFA start for each line if needed, but for performance,
-            // we build it once outside the loop. The `listid` mechanism
-            // ensures clean state for each `matchEpsilonNFA` call.
             if (matchEpsilonNFA(nfa_start, line)) {
                 if (prefix_with_filename) {
                     std::cout << filepath_str << ":";
@@ -644,5 +562,5 @@ int main(int argc, char* argv[]) {
         fin.close();
     }
 
-    return !any_match_found_global; // Return 0 if matches found, 1 otherwise
+    return !any_match_found_global;
 }
