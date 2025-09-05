@@ -18,7 +18,7 @@ struct State {
     int c = -1;
     int lastlist = -1;
     std::vector<int> match_set;
-    
+
     // For capture groups
     int capture_start = -1;  // If >= 0, this state starts capture group N
     int capture_end = -1;    // If >= 0, this state ends capture group N
@@ -46,7 +46,6 @@ enum {
 
 // --- Global Counters ---
 int next_capture_id = 1;
-int listid = 0;
 
 // --- Utility Functions ---
 std::vector<std::string> find_files_recursively(fs::path dir) {
@@ -72,12 +71,12 @@ Fragment parse(std::string_view&, Fragment, int);
 
 // --- NFA Construction ---
 Fragment parse_primary(std::string_view& rx) {
-    auto state = std::make_shared<State>();
-    Fragment frag { state, { &state->out } };
-
     if (rx.empty()) {
         throw std::runtime_error("Unexpected end of pattern");
     }
+
+    auto state = std::make_shared<State>();
+    Fragment frag { state, { &state->out } };
 
     char c = rx.front();
     rx.remove_prefix(1);
@@ -98,7 +97,7 @@ Fragment parse_primary(std::string_view& rx) {
             rx.remove_prefix(1);
             if (c == 'd') state->c = MatchDigit;
             else if (c == 'w') state->c = MatchWord;
-            else if (isdigit(c)) {
+            else if (isdigit(static_cast<unsigned char>(c))) {
                 state->c = BackRefStart + (c - '0');
             } else state->c = c;
             break;
@@ -122,31 +121,31 @@ Fragment parse_primary(std::string_view& rx) {
         case '(': {
             // Create capture group with proper start/end states
             int current_capture_id = next_capture_id++;
-            
-            // Create capture start state
+
+            // Create capture start state (epsilon-like)
             auto start_state = std::make_shared<State>();
-            start_state->c = Split;  // Use Split as epsilon-like transition
+            start_state->c = Split;
             start_state->capture_start = current_capture_id;
-            
+
             // Parse inner content
             Fragment inner = parse(rx, parse_primary(rx), 0);
-            
+
             if (rx.empty() || rx.front() != ')') {
                 throw std::runtime_error("Expected ')' to close group");
             }
             rx.remove_prefix(1);
-            
-            // Create capture end state
+
+            // Create capture end state (epsilon-like)
             auto end_state = std::make_shared<State>();
             end_state->c = Split;
             end_state->capture_end = current_capture_id;
-            
+
             // Wire together: start_state -> inner -> end_state
             start_state->out = inner.start;
             for (auto o : inner.out) {
                 *o = end_state;
             }
-            
+
             frag = { start_state, { &end_state->out } };
             break;
         }
@@ -161,11 +160,11 @@ Fragment parse_primary(std::string_view& rx) {
                 auto s = std::make_shared<State>();
                 s->c = Split;
                 s->out = frag.start;
-                
+
                 for (auto o : frag.out) {
                     *o = s;
                 }
-                
+
                 frag = { s, { &s->out1 } };
                 rx.remove_prefix(1);
             } break;
@@ -173,11 +172,11 @@ Fragment parse_primary(std::string_view& rx) {
                 auto s = std::make_shared<State>();
                 s->c = Split;
                 s->out = frag.start;
-                
+
                 for (auto o : frag.out) {
                     *o = s;
                 }
-                
+
                 frag.out = { &s->out1 };
                 rx.remove_prefix(1);
             } break;
@@ -185,7 +184,7 @@ Fragment parse_primary(std::string_view& rx) {
                 auto s = std::make_shared<State>();
                 s->c = Split;
                 s->out = frag.start;
-                
+
                 frag.start = s;
                 frag.out.push_back(&s->out1);
                 rx.remove_prefix(1);
@@ -274,11 +273,13 @@ std::shared_ptr<State> regex2nfa(std::string_view rx_str) {
 
 // --- NFA Simulation with Captures ---
 struct CaptureInfo {
-    std::map<int, std::string> groups;
-    std::map<int, int> backref_pos;  // Position in backreference matching
-    
+    std::map<int, std::string> groups;     // capture_id -> captured text
+    std::map<int, bool> active;            // capture_id -> currently active?
+    std::map<int, size_t> backref_pos;     // capture_id -> progress while matching a backref
+
     bool operator<(const CaptureInfo& other) const {
         if (groups != other.groups) return groups < other.groups;
+        if (active != other.active) return active < other.active;
         return backref_pos < other.backref_pos;
     }
 };
@@ -286,7 +287,7 @@ struct CaptureInfo {
 struct NFAState {
     std::shared_ptr<State> state;
     CaptureInfo captures;
-    
+
     bool operator<(const NFAState& other) const {
         if (state != other.state) return state < other.state;
         return captures < other.captures;
@@ -305,14 +306,15 @@ void addstate(std::shared_ptr<State> s, CaptureInfo cap_info, List& l, std::set<
     if (!s || visited.count(s)) return;
     visited.insert(s);
 
-    // Handle capture start/end
+    // Toggle capture start/end on epsilon-like nodes
     if (s->capture_start >= 0) {
-        cap_info.groups[s->capture_start] = "";
-        cap_info.backref_pos[s->capture_start] = 0;
+        int gid = s->capture_start;
+        cap_info.groups[gid].clear();
+        cap_info.active[gid] = true;
     }
-    
     if (s->capture_end >= 0) {
-        // End of capture - the content is already in the group
+        int gid = s->capture_end;
+        cap_info.active[gid] = false;
     }
 
     if (s->c == Split) {
@@ -331,23 +333,26 @@ void startlist(std::shared_ptr<State> start, List& l) {
     addstate(start, cap, l, visited);
 }
 
-void match_step(List& cl, char c, List& nl, const std::string& full_text, size_t pos) {
+void match_step(List& cl, char c, List& nl) {
     nl.clear();
-    
+
     for (const NFAState& ns : cl) {
         auto s = ns.state;
-        auto cap_info = ns.captures;
+        auto cap = ns.captures; // copy per-path
+
         bool should_advance = false;
-        
+        bool is_backref = false;
+        int backref_id = -1;
+
         switch (s->c) {
             case MatchAny:
                 should_advance = true;
                 break;
             case MatchDigit:
-                should_advance = isdigit(c);
+                should_advance = isdigit(static_cast<unsigned char>(c));
                 break;
             case MatchWord:
-                should_advance = (isalnum(c) || c == '_');
+                should_advance = (isalnum(static_cast<unsigned char>(c)) || c == '_');
                 break;
             case MatchChoice:
                 should_advance = (std::find(s->match_set.begin(), s->match_set.end(), c) != s->match_set.end());
@@ -359,59 +364,58 @@ void match_step(List& cl, char c, List& nl, const std::string& full_text, size_t
                 if (s->c == c) {
                     should_advance = true;
                 } else if (s->c >= BackRefStart) {
-                    // Handle backreference
-                    int backref_id = s->c - BackRefStart;
-                    
-                    if (cap_info.groups.count(backref_id)) {
-                        const std::string& captured = cap_info.groups[backref_id];
-                        int pos_in_ref = cap_info.backref_pos[backref_id];
-                        
-                        if (!captured.empty() && pos_in_ref < captured.length() && captured[pos_in_ref] == c) {
-                            cap_info.backref_pos[backref_id]++;
-                            
-                            if (cap_info.backref_pos[backref_id] >= captured.length()) {
-                                // Finished matching backreference
-                                cap_info.backref_pos[backref_id] = 0;
-                                should_advance = true;
-                            } else {
-                                // Continue matching backreference
-                                // Add character to active captures
-                                for (auto& [gid, content] : cap_info.groups) {
-                                    // Only add to groups that we're currently inside
-                                    // This is a simplification - we should track active groups properly
-                                    if (gid != backref_id) {  // Don't modify the group we're referencing
-                                        cap_info.groups[gid] += c;
-                                    }
+                    // Backreference matching
+                    is_backref = true;
+                    backref_id = s->c - BackRefStart;
+                    auto it = cap.groups.find(backref_id);
+                    if (it != cap.groups.end()) {
+                        const std::string& captured = it->second;
+                        if (!captured.empty()) {
+                            size_t pos = cap.backref_pos[backref_id];
+                            if (pos < captured.size() && captured[pos] == c) {
+                                pos++;
+                                if (pos == captured.size()) {
+                                    // Completed the backreference; reset progress and advance to next state
+                                    cap.backref_pos[backref_id] = 0;
+                                    should_advance = true;
+                                } else {
+                                    // Stay on this state and continue matching next char
+                                    cap.backref_pos[backref_id] = pos;
+                                    // Do not add to captures while matching a backreference
+                                    // Stay
+                                    nl.push_back({ s, cap });
+                                    continue;
                                 }
-                                nl.push_back({ s, cap_info });
-                                continue;
+                            } else {
+                                // Mismatch on backreference -> this path dies
                             }
                         }
+                        // empty captured string -> treat as mismatch (can't match anything)
                     }
+                    // group not captured -> mismatch
                 }
                 break;
         }
-        
+
         if (should_advance) {
-            // Add character to all active capture groups
-            // This is simplified - we should track which groups are currently active
-            for (auto& [group_id, content] : cap_info.groups) {
-                // Add to groups that exist and are presumably active
-                cap_info.groups[group_id] += c;
+            // Append consumed character to all *active* groups only (not to all)
+            for (auto& [gid, isActive] : cap.active) {
+                if (isActive) {
+                    cap.groups[gid].push_back(c);
+                }
             }
-            
+
             std::set<std::shared_ptr<State>> visited;
-            addstate(s->out, cap_info, nl, visited);
+            addstate(s->out, cap, nl, visited);
         }
     }
 }
 
 int matchEpsilonNFA(std::shared_ptr<State> start, std::string_view text) {
     List cl, nl;
-    
-    bool match_from_start = false;
-    if (start->c == MatchStart) {
-        match_from_start = true;
+
+    bool anchored_at_start = (start->c == MatchStart);
+    if (anchored_at_start) {
         std::set<std::shared_ptr<State>> visited;
         CaptureInfo initial_cap{};
         addstate(start->out, initial_cap, cl, visited);
@@ -419,47 +423,47 @@ int matchEpsilonNFA(std::shared_ptr<State> start, std::string_view text) {
         startlist(start, cl);
     }
 
-    std::string text_str(text);  // Convert to string for easier handling
-    
-    for (size_t text_idx = 0; text_idx <= text.length(); ++text_idx) {
-        char current_char = (text_idx < text.length()) ? text[text_idx] : '\0';
-
-        // Handle end anchor
-        if (current_char == '\0') {
-            List final_cl;
-            for (const NFAState& ns : cl) {
+    const size_t N = text.size();
+    for (size_t i = 0; i <= N; ++i) {
+        // If we've consumed all input, try to satisfy end-anchor and Matched
+        if (i == N) {
+            // Process end-anchor transitions
+            List after_end;
+            for (const auto& ns : cl) {
                 if (ns.state->c == MatchEnd) {
                     std::set<std::shared_ptr<State>> visited;
-                    addstate(ns.state->out, ns.captures, final_cl, visited);
+                    addstate(ns.state->out, ns.captures, after_end, visited);
                 } else {
-                    final_cl.push_back(ns);
+                    after_end.push_back(ns);
                 }
             }
-            if (ismatch(final_cl)) {
-                return 1;
-            }
+            if (ismatch(after_end)) return 1;
         }
 
-        // Restart matching if needed
-        if (!match_from_start && cl.empty() && text_idx < text.length()) {
+        if (i == N) break;
+
+        char c = text[i];
+
+        // If no states are active (and not anchored), restart from next position
+        if (cl.empty() && !anchored_at_start) {
             startlist(start, cl);
         }
 
-        if (!cl.empty() && text_idx < text.length()) {
-            match_step(cl, current_char, nl, text_str, text_idx);
-            std::swap(cl, nl);
+        if (!cl.empty()) {
+            match_step(cl, c, nl);
+            cl.swap(nl);
         }
 
         if (ismatch(cl)) {
             return 1;
         }
 
-        // Try starting new match from current position
-        if (cl.empty() && !match_from_start && text_idx < text.length()) {
+        // If match failed and not anchored, try starting from next character
+        if (cl.empty() && !anchored_at_start) {
             startlist(start, cl);
             if (!cl.empty()) {
-                match_step(cl, current_char, nl, text_str, text_idx);
-                std::swap(cl, nl);
+                match_step(cl, c, nl);
+                cl.swap(nl);
                 if (ismatch(cl)) return 1;
             }
         }
@@ -474,7 +478,7 @@ int main(int argc, char* argv[]) {
     std::cerr << std::unitbuf;
 
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " [-r] -E pattern [file ...]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " [-r] -E pattern [file ...]\n";
         return 1;
     }
 
@@ -514,7 +518,7 @@ int main(int argc, char* argv[]) {
     try {
         nfa_start = regex2nfa(pattern_str);
     } catch (const std::runtime_error& e) {
-        std::cerr << "Regex parsing error: " << e.what() << std::endl;
+        std::cerr << "Regex parsing error: " << e.what() << '\n';
         return 1;
     }
 
@@ -527,7 +531,7 @@ int main(int argc, char* argv[]) {
             std::string line;
             while (std::getline(std::cin, line)) {
                 if (matchEpsilonNFA(nfa_start, line)) {
-                    std::cout << line << std::endl;
+                    std::cout << line << '\n';
                     any_match_found_global = true;
                 }
             }
@@ -546,9 +550,9 @@ int main(int argc, char* argv[]) {
             if (fs::is_regular_file(target)) {
                 files_to_process.push_back(target);
             } else if (fs::exists(target)) {
-                std::cerr << "Warning: Skipping non-regular file: " << target << std::endl;
+                std::cerr << "Warning: Skipping non-regular file: " << target << '\n';
             } else {
-                std::cerr << "Error: Path not found: " << target << std::endl;
+                std::cerr << "Error: Path not found: " << target << '\n';
             }
         }
     }
@@ -558,7 +562,7 @@ int main(int argc, char* argv[]) {
     for (const auto& filepath_str : files_to_process) {
         std::ifstream fin(filepath_str);
         if (!fin.is_open()) {
-            std::cerr << "Error: Could not open file " << filepath_str << std::endl;
+            std::cerr << "Error: Could not open file " << filepath_str << '\n';
             continue;
         }
 
@@ -566,9 +570,9 @@ int main(int argc, char* argv[]) {
         while (std::getline(fin, line)) {
             if (matchEpsilonNFA(nfa_start, line)) {
                 if (prefix_with_filename) {
-                    std::cout << filepath_str << ":";
+                    std::cout << filepath_str << ':';
                 }
-                std::cout << line << std::endl;
+                std::cout << line << '\n';
                 any_match_found_global = true;
             }
         }
