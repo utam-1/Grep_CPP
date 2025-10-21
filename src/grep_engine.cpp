@@ -479,27 +479,69 @@ void process_character_step(ActiveStateList &current_states, char input_char, Ac
 struct MatchInfo
 {
     bool found;
-    size_t start_pos;
-    size_t end_pos;
+    std::vector<std::pair<size_t, size_t>> matches; // Each pair is {start_pos, end_pos}
 };
 
-MatchInfo match_text_with_positions(std::shared_ptr<NFAState> nfa_start_state, std::string_view input_text)
+MatchInfo match_text_with_positions(std::shared_ptr<NFAState> nfa_start_state, std::string_view original_input_text)
 {
-    ActiveStateList current_states, next_states;
-    initialize_active_states(nfa_start_state, current_states);
-    size_t match_start = 0;
+    MatchInfo result_info = {false, {}};
     profiler.lines_processed++;
 
-    for (size_t i = 0; i <= input_text.size(); ++i)
+    size_t current_global_pos = 0; // Tracks our position in the original_input_text
+
+    // Loop to find all non-overlapping matches
+    while (current_global_pos <= original_input_text.size())
     {
-        if (has_matching_state(current_states))
-            return {true, match_start, i};
-        if (i == input_text.size())
-            break;
-        process_character_step(current_states, input_text[i], next_states);
-        current_states.swap(next_states);
+        // Create a string_view for the remaining part of the text
+        std::string_view remaining_text = original_input_text.substr(current_global_pos);
+
+        ActiveStateList current_states, next_states;
+        initialize_active_states(nfa_start_state, current_states);
+
+        bool match_found_in_this_segment = false;
+        size_t match_length = 0; // To store the length of the match found
+
+        // Simulate NFA on the remaining_text
+        for (size_t i = 0; i <= remaining_text.size(); ++i) // 'i' is now an index into remaining_text
+        {
+            if (has_matching_state(current_states))
+            {
+                match_found_in_this_segment = true;
+                match_length = i; // 'i' is the end_pos relative to remaining_text
+                break; // Found the shortest match in this segment
+            }
+
+            if (i == remaining_text.size())
+                break; // Reached end of remaining text
+
+            // Pass the character from remaining_text
+            process_character_step(current_states, remaining_text[i], next_states);
+            current_states.swap(next_states);
+        }
+
+        if (match_found_in_this_segment)
+        {
+            result_info.found = true;
+            result_info.matches.push_back({current_global_pos, current_global_pos + match_length});
+
+            // Move current_global_pos past the found match for the next search
+            // Ensure we advance by at least 1 for zero-length matches to prevent infinite loop
+            current_global_pos += std::max((size_t)1, match_length);
+        }
+        else
+        {
+            // No match found starting from current_global_pos.
+            // Advance by one character to try again from the next position,
+            // unless we are already at the end.
+            if (current_global_pos < original_input_text.size()) {
+                current_global_pos++;
+            } else {
+                break; // No more characters to try
+            }
+        }
     }
-    return {false, 0, 0};
+
+    return result_info;
 }
 
 // --- Output ---
@@ -510,12 +552,25 @@ void print_with_color(const std::string &line, const MatchInfo &match_info, bool
         std::cout << line << '\n';
         return;
     }
-    std::cout << line.substr(0, match_info.start_pos)
-              << COLOR_RED_BOLD
-              << line.substr(match_info.start_pos, match_info.end_pos - match_info.start_pos)
-              << COLOR_RESET
-              << line.substr(match_info.end_pos)
-              << '\n';
+
+    size_t current_pos = 0;
+    for (const auto &match_pair : match_info.matches)
+    {
+        size_t match_start = match_pair.first;
+        size_t match_end = match_pair.second;
+
+        // Print text before the current match
+        std::cout << line.substr(current_pos, match_start - current_pos);
+
+        // Print the matched text in color
+        std::cout << COLOR_RED_BOLD
+                  << line.substr(match_start, match_end - match_start)
+                  << COLOR_RESET;
+
+        current_pos = match_end; // Update current position to after the match
+    }
+    // Print any remaining text after the last match
+    std::cout << line.substr(current_pos) << '\n';
 }
 
 // --- Main ---
