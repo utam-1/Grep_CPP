@@ -43,6 +43,18 @@ static void test_character_classes() {
     CPP_ASSERT_TRUE(re_neg.matches("apple")); /* 'p', 'l', 'e' match negation */
     CPP_ASSERT_TRUE(!re_neg.matches("a"));
 
+    grep::Regex re_range("^[a-z]+$");
+    CPP_ASSERT_TRUE(re_range.matches("apple"));
+    CPP_ASSERT_TRUE(re_range.matches("orange"));
+    CPP_ASSERT_TRUE(!re_range.matches("Apple"));
+    CPP_ASSERT_TRUE(!re_range.matches("123"));
+
+    grep::Regex re_edge_bracket("[]a-]");
+    CPP_ASSERT_TRUE(re_edge_bracket.matches("]"));
+    CPP_ASSERT_TRUE(re_edge_bracket.matches("-"));
+    CPP_ASSERT_TRUE(re_edge_bracket.matches("a"));
+    CPP_ASSERT_TRUE(!re_edge_bracket.matches("b"));
+
     grep::Regex re_digits("\\d+");
     CPP_ASSERT_TRUE(re_digits.matches("order 12345 completed"));
     CPP_ASSERT_TRUE(!re_digits.matches("order completed"));
@@ -67,6 +79,14 @@ static void test_quantifiers() {
     CPP_ASSERT_TRUE(re_question.matches("ac"));
     CPP_ASSERT_TRUE(re_question.matches("abc"));
     CPP_ASSERT_TRUE(!re_question.matches("abbc"));
+
+    /* Greedy longest match verification */
+    grep::Regex re_greedy("a.*a");
+    grep::MatchInfo mi = re_greedy.find_all("xababax");
+    CPP_ASSERT_TRUE(mi.found);
+    CPP_ASSERT_EQ(mi.matches.size(), 1u);
+    CPP_ASSERT_EQ(mi.matches[0].first, 1u);
+    CPP_ASSERT_EQ(mi.matches[0].second, 6u);
 }
 
 static void test_alternation() {
@@ -99,6 +119,12 @@ static void test_groups_and_backreferences() {
 
     CPP_ASSERT_TRUE(mi.detailed_matches[1].captures[1].first);
     CPP_ASSERT_EQ(mi.detailed_matches[1].captures[1].second, "banana");
+
+    /* Empty capture group backreference */
+    grep::Regex re_empty("^(a?)\\1$");
+    CPP_ASSERT_TRUE(re_empty.matches(""));
+    CPP_ASSERT_TRUE(re_empty.matches("aa"));
+    CPP_ASSERT_TRUE(!re_empty.matches("a"));
 }
 
 static void test_anchors() {
@@ -114,13 +140,34 @@ static void test_anchors() {
     CPP_ASSERT_TRUE(exact.matches("exact"));
     CPP_ASSERT_TRUE(!exact.matches("not exact"));
     CPP_ASSERT_TRUE(!exact.matches("exact not"));
+
+    grep::Regex grouped_anchor("(^foo$)|(^bar$)");
+    CPP_ASSERT_TRUE(grouped_anchor.matches("foo"));
+    CPP_ASSERT_TRUE(grouped_anchor.matches("bar"));
+    CPP_ASSERT_TRUE(!grouped_anchor.matches("xfoo"));
+    CPP_ASSERT_TRUE(!grouped_anchor.matches("barx"));
+
+    grep::Regex empty_line("^$");
+    CPP_ASSERT_TRUE(empty_line.matches(""));
+    CPP_ASSERT_TRUE(!empty_line.matches("a"));
+}
+
+static void test_copy_and_assign() {
+    grep::Regex r1("([0-9]+)");
+    grep::Regex r2(r1);
+    grep::Regex r3("abc");
+    r3 = r1;
+
+    CPP_ASSERT_TRUE(r2.matches("val=42"));
+    CPP_ASSERT_TRUE(r3.matches("val=99"));
+    CPP_ASSERT_EQ(r3.pattern(), "([0-9]+)");
 }
 
 static void test_syntax_errors() {
     bool caught = false;
     try {
         grep::Regex invalid("[unclosed");
-    } catch (const grep::RegexError &e) {
+    } catch (const grep::RegexError &) {
         caught = true;
     }
     CPP_ASSERT_TRUE(caught);
@@ -128,7 +175,7 @@ static void test_syntax_errors() {
     caught = false;
     try {
         grep::Regex invalid("(unclosed group");
-    } catch (const grep::RegexError &e) {
+    } catch (const grep::RegexError &) {
         caught = true;
     }
     CPP_ASSERT_TRUE(caught);
@@ -136,7 +183,31 @@ static void test_syntax_errors() {
     caught = false;
     try {
         grep::Regex invalid("unmatched)");
-    } catch (const grep::RegexError &e) {
+    } catch (const grep::RegexError &) {
+        caught = true;
+    }
+    CPP_ASSERT_TRUE(caught);
+
+    caught = false;
+    try {
+        grep::Regex invalid(")");
+    } catch (const grep::RegexError &) {
+        caught = true;
+    }
+    CPP_ASSERT_TRUE(caught);
+
+    caught = false;
+    try {
+        grep::Regex invalid("a**");
+    } catch (const grep::RegexError &) {
+        caught = true;
+    }
+    CPP_ASSERT_TRUE(caught);
+
+    caught = false;
+    try {
+        grep::Regex invalid("a|");
+    } catch (const grep::RegexError &) {
         caught = true;
     }
     CPP_ASSERT_TRUE(caught);
@@ -178,6 +249,7 @@ int main() {
     test_alternation();
     test_groups_and_backreferences();
     test_anchors();
+    test_copy_and_assign();
     test_syntax_errors();
     test_profiler();
     test_colored_formatting();
@@ -185,4 +257,3 @@ int main() {
     std::cout << "C++ Tests Summary: " << passed_cpp_tests << " / " << total_cpp_tests << " passed" << std::endl;
     return (passed_cpp_tests == total_cpp_tests) ? 0 : 1;
 }
-

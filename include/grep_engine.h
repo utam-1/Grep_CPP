@@ -147,6 +147,12 @@ void grep_profiler_reset(grep_profiler_t *profiler);
 #include <utility>
 #include <stdexcept>
 
+#if __cplusplus >= 201103L
+#define GREP_NOEXCEPT noexcept
+#else
+#define GREP_NOEXCEPT throw()
+#endif
+
 namespace grep {
 
 /**
@@ -157,7 +163,9 @@ public:
     explicit RegexError(const std::string &message, int code = GREP_ERR_SYNTAX)
         : std::runtime_error(message), code_(code) {}
 
-    int code() const throw() { return code_; }
+    virtual ~RegexError() GREP_NOEXCEPT {}
+
+    int code() const GREP_NOEXCEPT { return code_; }
 
 private:
     int code_;
